@@ -25,7 +25,7 @@ PRD §15 的問題尚未定案，本規格先採以下預設，定案後只需�
 ### 1.1 依賴
 | 套件 | 版本要求 | 用途 |
 |------|---------|------|
-| `three` | ≥ r170，實作時鎖定當下最新穩定版 | `three/webgpu`（WebGPURenderer）、`three/tsl`（著色器與 compute） |
+| `three` | **鎖定 0.184.0**（r185 起建立貼圖 view 時一律帶 `swizzle`，部分 Chrome 版本會直接拋 TypeError；升級前需確認） | `three/webgpu`（WebGPURenderer）、`three/tsl`（著色器） |
 | `typescript` | 5.x，`strict: true` | — |
 | `vite` | 最新穩定版 | 開發伺服器與打包 |
 | `vitest` | 最新穩定版 | 單元測試 |
@@ -39,7 +39,6 @@ PRD §15 的問題尚未定案，本規格先採以下預設，定案後只需�
 /
 ├── index.html
 ├── public/
-│   └── fallback.jpg            // 無 WebGPU / WebGL2 時顯示
 ├── src/
 │   ├── main.ts
 │   ├── config.ts               // 所有可調常數（本文件中的數值集中於此）
@@ -68,6 +67,8 @@ PRD §15 的問題尚未定案，本規格先採以下預設，定案後只需�
 | `lint` | `eslint .`（typescript-eslint recommended） |
 
 ### 1.4 URL 參數（除錯與測試用）
+
+> M0 已實作 `renderer` 與 `debug`（lil-gui：Firmness、Wave damping、Tide、Pause、FPS）；其餘於後續里程碑加入。
 | 參數 | 值 | 作用 |
 |------|----|------|
 | `debug` | `1` | 顯示 lil-gui 與 FPS 面板 |
@@ -205,9 +206,9 @@ type GameEvent =
 
 ### 4.1 水面高度場 `sim/heightfield.ts` [P-01][P-06][R-04]
 
-**資料**：三個 `instancedArray(N*N, 'float')` storage buffer：`hPrev`、`hCurr`、`hNext`（輪替），`N = 256`（low 品質為 128）。格距 `dx = 40 / N`。
+**資料**：兩張 N×N 的 float32 RGBA render target 交替使用（ping-pong），`R = h`、`G = 上一步的 h`；`N = 256`（low 品質為 128）。格距 `dx = 40 / N`。每一步以全螢幕四邊形從一張讀、寫進另一張。不用 storage buffer compute，是因為 WebGL2 後端無法在 compute 與頂點著色器中隨機存取 storage buffer；render-to-texture 讓兩個後端共用同一條路徑。模擬材質必須 `NoBlending`（float32 在 WebGPU 不可混色，否則 pipeline 被拒）。
 
-**更新方程**（每個 SIM_DT 一次 compute dispatch）：
+**更新方程**（每個 SIM_DT 一次全螢幕 pass）：
 ```
 lap   = h[i-1,j] + h[i+1,j] + h[i,j-1] + h[i,j+1] - 4h[i,j]
 hNext = (2·h - hPrev + (c·dt/dx)² · lap) · decay + source[i,j]
@@ -226,7 +227,7 @@ interface Disturbance { x: number; z: number; radius: number; amount: number } /
 
 | 來源 | radius | amount（每步） |
 |------|--------|---------------|
-| 滑鼠拖曳水面 | 0.9 | `-0.012 × clamp(指標速度 u/s, 0, 20)`，沿軌跡每 0.3 u 插一點 |
+| 滑鼠拖曳水面 | 0.9 | 每段指標移動總量 `-0.012 × clamp(指標速度 u/s, 0, 20)`，沿軌跡每 0.3 u 插一點、平均分配 |
 | 點擊（未拖曳） | 0.6 | `-0.06` 單次 |
 | 救生圈落水 | 0.5 | `-0.02 × 落水速度` 單次 |
 | 小艇尾跡 | 0.35 | `-0.004` 持續，位於船尾 |
@@ -595,15 +596,15 @@ interface FlavourPreset { shallow: Color; deep: Color; rim: Color; absorb: Vec3 
 
 ### 10.1 初始化
 ```ts
-const renderer = new WebGPURenderer({ antialias: false, forceWebGL: params.renderer === 'webgl' });
-await renderer.init();                                   // 失敗 → 顯示 fallback
+const renderer = new WebGPURenderer({ antialias: true, forceWebGL: params.renderer === 'webgl' });
+await renderer.init();                                   // WebGPU 失敗 → 改用 WebGL2 重試
 const backend = renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2';
 ```
 - `devicePixelRatio` 上限：high 2.0、medium 1.5、low 1.0。
-- 色彩空間 sRGB，色調映射 `AgXToneMapping`。
+- 色彩空間 sRGB，色調映射 `NeutralToneMapping`（AgX 會把粉彩色洗淡）。
 
 ### 10.2 每幀順序
-1. **compute**：高度場步進 × n（n = 本幀模擬步數）→（每 2 幀）浮力降採樣。
+1. **模擬**：高度場步進 × n（n = 本幀模擬步數，每步一個全螢幕 pass）→（每 2 幀）浮力降採樣。
 2. **背景**：天空／宇宙全螢幕四邊形（Cosmos 為 1/4 解析度 RT 放大）。
 3. **不透明 pass**：方塊、陸地、建物、海床、船、救生圈 → 顏色 + 深度 RT。
 4. **水體 pass**：頂面與側面，讀取步驟 3 的顏色與深度做折射與吸收；寫入同一 RT。
@@ -619,7 +620,7 @@ const backend = renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2';
 |------|------|--------|-----|
 | 高度場 N | 256 | 256 | 128 |
 | 水面網格 | 160² | 120² | 80² |
-| 陰影 | 2048 PCF soft | 1024 PCF | 關（烘焙 AO） |
+| 陰影 | 2048 PCF | 1024 PCF | 關（烘焙 AO） |
 | Bloom | 全解析 | 半解析 | 關 |
 | 移軸景深 | 開 | 關 | 關 |
 | 魚數 | 48 | 48 | 24 |
@@ -632,14 +633,15 @@ const backend = renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2';
 |------|------|
 | Draw calls | 150 |
 | 三角形 | 600k |
-| compute dispatch / 幀 | ≤ 6 |
+| 模擬 pass / 幀 | ≤ 6 |
 | GPU→CPU 讀回 | ≤ 16 KB / 2 幀 |
 | JS 主執行緒 / 幀 | ≤ 4 ms（中階筆電） |
 | 首次可互動 | ≤ 3 s（含著色器編譯；編譯期間顯示 Loading 淡出畫面） |
 | 打包大小 | JS ≤ 900 KB gzip（three 本體佔多數），無其他大型資產 |
 
 ### 10.6 錯誤處理
-- `renderer.init()` 拋錯或 `navigator.gpu` 不存在且 WebGL2 也不可用 → 隱藏 canvas，顯示 `fallback.jpg` 與一行說明文字。
+- 啟動時先清空模擬並同步畫一幀作為探測；WebGPU 在 `init()` 或探測幀拋錯 → 拆掉場景、以 WebGL2 重建。
+- WebGL2 也失敗 → 不顯示 canvas，改顯示標題、一行說明與錯誤訊息。
 - WebGPU `device.lost` → 嘗試以 WebGL2 重建一次；再失敗則顯示 fallback。
 - 狀態膠囊綠點 `#3DBE7A` = WebGPU；黃點 `#E8B44A` = WebGL2。
 
@@ -753,7 +755,9 @@ const backend = renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2';
 - **冒煙**：頁面無 console error；狀態膠囊文字正確；canvas 非空白（取樣像素變異數 > 閾值）。
 - **截圖迴歸**：四種氛圍 × 預設鏡頭共 4 張、三種口味 × Sunset 共 3 張，像素差容忍 2%。
 - **互動**：點擊 Cast off 後標題變為 `Casting off…`；Feed the fish 使 Fed 變為 1；切換 Atmosphere 後膠囊文字更新；Tide 滑桿顯示 `cm`。
-- WebGPU 在無頭 Chromium 可能不可用：e2e 預設以 `?renderer=webgl` 執行，另有一組標記為可選的 WebGPU 測試。
+- e2e 分 `webgl2`（`?renderer=webgl`）與 `webgpu` 兩個 project；後者以 SwiftShader 參數啟動，必須同時帶 `--use-angle=swiftshader`，否則裝置會遺失貼圖。
+- 無頭 Chromium 截不到 WebGPU canvas，像素比對改用 `window.__seaside.capture(w, h)`：渲染到離屏 target 再讀回（寬度須為 64 的倍數，避免 WebGPU 讀回的列填充）。
+- 軟體渲染一幀可能數百毫秒，測試一律等「幀數前進 N」而非固定時間。
 
 ### 13.3 手動驗收
 對照 PRD §13 的 10 條 P0 驗收標準逐條確認，並與參考截圖並排比較。
@@ -764,7 +768,7 @@ const backend = renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2';
 
 | 里程碑 | 任務（依序） | 完成定義 |
 |--------|-------------|---------|
-| **M0** | 1. Vite/TS/three 專案骨架、lint、vitest、playwright 設定　2. 渲染器初始化與 fallback　3. 空方塊 + 地層側面　4. 高度場 compute + 水面網格 + 拖曳造浪　5. Orbit 鏡頭 | 拖曳水面有波、60 FPS、單元測試通過 |
+| **M0** | 1. Vite/TS/three 專案骨架、lint、vitest、playwright 設定　2. 渲染器初始化與 fallback　3. 空方塊 + 地層側面　4. 高度場模擬 + 水面網格 + 拖曳造浪　5. Orbit 鏡頭 | 拖曳水面有波、60 FPS、單元測試通過 |
 | **M1** | 6. store / events / loop / 持久化　7. 果凍海材質（折射、吸收、菲涅耳、剖面）　8. jellyBody 與掀方塊　9. 程式化陸地、小鎮、碼頭、防波堤、燈塔　10. 貨輪、起重機、港口狀態機　11. 浮力與救生圈　12. 面板 UI 全部 P0 元件　13. Sunset + Cosmos 氛圍、三種口味　14. 鏡頭預設與過渡　15. Horn、水花音效、Sound 開關 | PRD §13 P0 驗收通過；e2e 冒煙與互動測試通過 |
 | **M2** | 16. Day / Night 氛圍與 Bloom　17. 海床散佈、魚群、餵魚　18. 焦散　19. 小艇尾跡、海鷗　20. 第一人稱　21. 完整音效與環境音　22. 品質分級與自動調整　23. 鍵盤快捷鍵　24. 截圖迴歸測試 | 與參考截圖並排評審通過 |
 | **M3** | 25. 小螢幕抽屜　26. zh-TW 文案　27. 彩蛋　28. 效能優化與打包大小檢查 | 效能預算全部達標 |
